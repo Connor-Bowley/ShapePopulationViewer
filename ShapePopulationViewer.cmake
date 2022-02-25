@@ -22,6 +22,8 @@ include(${SlicerExecutionModel_USE_FILE})
 find_package(VTK REQUIRED)
 include(${VTK_USE_FILE})
 
+find_package(RapidJSON REQUIRED)
+
 if(ShapePopulationViewer_QT_VERSION VERSION_EQUAL "4")
   find_package(Qt4 REQUIRED)
   include(${QT_USE_FILE})

@@ -51,6 +51,10 @@ class ShapePopulationData
     std::string m_FileName;
     std::string m_FileDir;
     std::vector<std::string> m_AttributeList;
+
+    private :
+
+    vtkSmartPointer<vtkPolyData> ReadSRepJson(const std::string& a_filePath);
 };
 
 

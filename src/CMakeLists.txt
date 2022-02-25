@@ -94,6 +94,7 @@ if(ShapePopulationViewer_BUILD_SLICER_EXTENSION)
 
   # Current_{source,binary} and Slicer_{Libs,Base} already included
   set(MODULE_INCLUDE_DIRECTORIES
+    ${RapidJSON_INCLUDE_DIR}
     )
   set(MODULE_SRCS
     qSlicer${MODULE_NAME}LayoutViewFactory.cxx

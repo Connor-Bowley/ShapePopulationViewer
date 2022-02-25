@@ -1,4 +1,19 @@
 #include "ShapePopulationData.h"
+#include <vtkTriangle.h>
+
+// Relax JSON standard and allow reading/writing of nan and inf
+// values. Such values should not normally occur, but if they do then
+// it is easier to troubleshoot problems if numerical values are the
+// same in memory and files.
+// kWriteNanAndInfFlag = 2,        //!< Allow writing of Infinity, -Infinity and NaN.
+#define RAPIDJSON_WRITE_DEFAULT_FLAGS 2
+// kParseNanAndInfFlag = 256,      //!< Allow parsing NaN, Inf, Infinity, -Inf and -Infinity as doubles.
+#define RAPIDJSON_PARSE_DEFAULT_FLAGS 256
+
+#include <rapidjson/document.h>     // rapidjson's DOM-style API
+#include <rapidjson/prettywriter.h> // for stringify JSON
+#include <rapidjson/filereadstream.h>
+#include <rapidjson/filewritestream.h>
 
 static bool endswith(std::string file, std::string ext)
 {
@@ -59,6 +74,27 @@ vtkSmartPointer<vtkPolyData> ShapePopulationData::ReadMesh(std::string a_filePat
         if(upPD == NULL || downPD == NULL || crestPD == NULL) return 0;
 
         ReadSRep(upPD, downPD, crestPD, a_filePath);
+    }
+    else if (endswith(a_filePath, ".srep.json"))
+    {
+        auto srepPolyData = ReadSRepJson(a_filePath);
+        if (srepPolyData)
+        {
+            m_PolyData = srepPolyData;
+            int numAttributes = m_PolyData->GetPointData()->GetNumberOfArrays();
+            for (int j = 0; j < numAttributes; j++)
+            {
+                int dim = m_PolyData->GetPointData()->GetArray(j)->GetNumberOfComponents();
+                const char * AttributeName = m_PolyData->GetPointData()->GetArrayName(j);
+
+                if (dim == 1)
+                {
+                    std::string AttributeString = AttributeName;
+                    m_AttributeList.push_back(AttributeString);
+                }
+            }
+            std::sort(m_AttributeList.begin(),m_AttributeList.end());
+        }
     }
     else
     {
@@ -211,3 +247,289 @@ vtkSmartPointer<vtkPolyData> ShapePopulationData::AttachCellType(vtkPolyData *po
     return polyData;
 }
 
+namespace {
+
+class FileRAII {
+public:
+    FileRAII(const std::string& a_filePath)
+    {
+        m_Handle = fopen(a_filePath.c_str(), "r");
+    }
+    ~FileRAII()
+    {
+        fclose(m_Handle);
+    }
+    FILE* GetHandle()
+    {
+        return m_Handle;
+    }
+private:
+    FILE* m_Handle;
+};
+
+namespace keys {
+  const char * const EllipticalSRep = "EllipticalSRep";
+  const char * const CrestPoints = "CrestPoints";
+  const char * const Steps = "Steps";
+  const char * const Skeleton = "Skeleton";
+  const char * const UpSpoke = "UpSpoke";
+  const char * const DownSpoke = "DownSpoke";
+  const char * const CrestSpoke = "CrestSpoke";
+  const char * const Direction = "Direction";
+  const char * const SkeletalPoint = "SkeletalPoint";
+  const char * const Value = "Value";
+  const char * const CoordinateSystem = "CoordinateSystem";
+}
+
+rapidjson::Value::MemberIterator SafeFindMember(rapidjson::Value& json, const char* name)
+{
+  auto iter = json.FindMember(name);
+  if (iter == json.MemberEnd())
+  {
+    throw std::invalid_argument(std::string("Error finding json member '") + name + "'");
+  }
+  return iter;
+}
+
+double readDouble(rapidjson::Value& json)
+{
+  if (!json.IsDouble())
+  {
+    throw std::invalid_argument("Expected a JSON double.");
+  }
+  return json.GetDouble();
+}
+
+int readUint(rapidjson::Value& json) {
+  if (!json.IsUint()) {
+    throw std::invalid_argument("Expected a JSON uint.");
+  }
+  return json.GetUint();
+}
+
+std::array<double, 3> read3DArray(rapidjson::Value& json)
+{
+    if (!json.IsArray())
+    {
+        throw std::invalid_argument("Attempting to read an array that is not a json array");
+    }
+    auto jsonArray = json.GetArray();
+
+    if (jsonArray.Size() != 3)
+    {
+        throw std::invalid_argument("Attempting to read a 3D array that doesn't have 3 dimensions");
+    }
+
+    std::array<double, 3> array;
+    std::transform(jsonArray.Begin(), jsonArray.End(), array.begin(), readDouble);
+    return array;
+}
+
+std::array<double, 3> read3DArrayAsRAS(rapidjson::Value& json)
+{
+    if (!json.IsObject()) {
+        throw std::invalid_argument("Attempting to read a LPS/RAS array that is not a json object");
+    }
+    auto value  = read3DArray(SafeFindMember(json, keys::Value)->value);
+    if (SafeFindMember(json, keys::CoordinateSystem)->value == "RAS") {
+        return value;
+    } else {
+        return std::array<double, 3>{-value[0], -value[1], value[2]};
+    }
+}
+
+vtkIdType addSpoke(vtkPolyData& polyData, rapidjson::Value& json, int cellType)
+{
+    auto spokePoints = polyData.GetPoints();
+    auto spokeLines = polyData.GetLines();
+    auto typeArray = static_cast<vtkIntArray*>(polyData.GetPointData()->GetScalars("cellType"));
+
+    auto skeletalIter = SafeFindMember(json, keys::SkeletalPoint);
+    auto directionIter = SafeFindMember(json, keys::Direction);
+
+    const auto skeletalPoint = read3DArrayAsRAS(skeletalIter->value);
+    const auto directionVector = read3DArrayAsRAS(directionIter->value);
+    const std::array<double, 3> boundaryPoint = {
+        skeletalPoint[0] + directionVector[0],
+        skeletalPoint[1] + directionVector[1],
+        skeletalPoint[2] + directionVector[2]
+    };
+    auto idS = spokePoints->InsertNextPoint(skeletalPoint.data());
+    auto idB = spokePoints->InsertNextPoint(boundaryPoint.data());
+
+    vtkNew<vtkLine> arrow;
+    arrow->GetPointIds()->SetId(0, idS);
+    arrow->GetPointIds()->SetId(1, idB);
+    spokeLines->InsertNextCell(arrow);
+
+    typeArray->InsertNextValue(cellType);
+    typeArray->InsertNextValue(cellType);
+
+    return idS;
+}
+
+void addCrestCurve(vtkPolyData& polyData, const std::vector<vtkIdType>& crestIds) {
+    auto spokePoints = polyData.GetPoints();
+    auto spokeLines = polyData.GetLines();
+    auto typeArray = static_cast<vtkIntArray*>(polyData.GetPointData()->GetScalars("cellType"));
+
+    // add lines for the crest, but duplicate the points so we can set different scalars
+    double p[3]; // buffer to store points in
+    for (size_t i = 0; i < crestIds.size(); ++i)
+    {
+        auto id0 = crestIds[i];
+        auto id1 = crestIds[(i + 1) % crestIds.size()];
+
+        spokePoints->GetPoint(id0, p);
+        auto id0Dup = spokePoints->InsertNextPoint(p);
+
+        spokePoints->GetPoint(id1, p);
+        auto id1Dup = spokePoints->InsertNextPoint(p);
+
+        vtkNew<vtkLine> arrow;
+        arrow->GetPointIds()->SetId(0, id0Dup);
+        arrow->GetPointIds()->SetId(1, id1Dup);
+        spokeLines->InsertNextCell(arrow);
+        typeArray->InsertNextValue(3);
+        typeArray->InsertNextValue(3);
+    }
+}
+
+void addMedialSheet(vtkPolyData& polyData, const std::vector<vtkIdType>& upIds, unsigned int numFoldPoints, unsigned int numStepsPlusCrest) {
+    auto spokePoints = polyData.GetPoints();
+    auto medialSheet = polyData.GetPolys();
+    auto typeArray = static_cast<vtkIntArray*>(polyData.GetPointData()->GetScalars("cellType"));
+    // add the medial sheet cells, but duplicate the points so we can set different scalars
+    std::vector<std::vector<vtkIdType>> newUpIds(numFoldPoints, std::vector<vtkIdType>(numStepsPlusCrest));
+    if (numFoldPoints * numStepsPlusCrest != upIds.size()) {
+        throw std::runtime_error("Got an unexpected amount of up ids: "
+            + std::to_string(numFoldPoints * numStepsPlusCrest) + " != " + std::to_string(upIds.size()));
+    }
+
+    double p[3]; // buffer to store points in
+    for (size_t l = 0; l < newUpIds.size(); ++l)
+    {
+        for (size_t s = 0; s < newUpIds[l].size(); ++s)
+        {
+            spokePoints->GetPoint(upIds[(l * numStepsPlusCrest + s)], p);
+            newUpIds[l][s] = spokePoints->InsertNextPoint(p);
+            typeArray->InsertNextValue(1);
+        }
+    }
+
+    // make medial sheet cells
+    // for each quad, make two triangles
+    //
+    //   .-.-.
+    //   |/|/|
+    //   .-.-.
+    for (size_t l = 0; l < newUpIds.size(); ++l)
+    {
+        auto nextL = (l + 1) % newUpIds.size();
+        for (size_t s = 0; s < newUpIds[l].size(); ++s)
+        {
+            auto nextS = (s + 1) % newUpIds[l].size();
+            vtkNew<vtkTriangle> tri1;
+            tri1->GetPointIds()->SetId(0, newUpIds[l][s]);
+            tri1->GetPointIds()->SetId(1, newUpIds[nextL][s]);
+            tri1->GetPointIds()->SetId(2, newUpIds[l][nextS]);
+
+            vtkNew<vtkTriangle> tri2;
+            tri2->GetPointIds()->SetId(0, newUpIds[nextL][nextS]);
+            tri2->GetPointIds()->SetId(1, newUpIds[nextL][s]);
+            tri2->GetPointIds()->SetId(2, newUpIds[l][nextS]);
+
+            medialSheet->InsertNextCell(tri1);
+            medialSheet->InsertNextCell(tri2);
+        }
+    }
+}
+
+vtkSmartPointer<vtkPolyData> ReadEllipticalSRepJson(rapidjson::Value& json)
+{
+    auto polyData = vtkSmartPointer<vtkPolyData>::New();
+    vtkNew<vtkPoints> spokePoints;
+    vtkNew<vtkCellArray> spokeLines;
+    vtkNew<vtkCellArray> medialSheet;
+    vtkNew<vtkIntArray> typeArray;
+    typeArray->SetName("cellType");
+    typeArray->SetNumberOfComponents(1);
+    polyData->SetPoints(spokePoints);
+    polyData->SetLines(spokeLines);
+    polyData->SetPolys(medialSheet);
+    polyData->GetPointData()->SetActiveScalars("cellType");
+    polyData->GetPointData()->SetScalars(typeArray);
+
+    const auto numFoldPoints = readUint(SafeFindMember(json, keys::CrestPoints)->value);
+    const auto numStepsPlusCrest = 1 + readUint(SafeFindMember(json, keys::Steps)->value);
+    auto& skeleton = SafeFindMember(json, keys::Skeleton)->value;
+    if (!skeleton.IsArray())
+    {
+        throw std::invalid_argument("Expected a JSON array.");
+    }
+
+    std::vector<vtkIdType> upIds;
+    std::vector<vtkIdType> crestIds;
+
+    for (auto& row : skeleton.GetArray())
+    { //row is the line out from the spine
+        if (!row.IsArray())
+        {
+            throw std::runtime_error("Error parsing in vtkMRMLEllipticalSRepNode. Row is not array.");
+        }
+        for (auto& object : row.GetArray())
+        {
+            upIds.push_back(addSpoke(*polyData, SafeFindMember(object, keys::UpSpoke)->value, 0));
+            addSpoke(*polyData, SafeFindMember(object, keys::DownSpoke)->value, 4);
+
+            auto crestIter = object.FindMember(keys::CrestSpoke);
+            if (crestIter != object.MemberEnd())
+            {
+                crestIds.push_back(addSpoke(*polyData, crestIter->value, 2));
+            }
+        }
+    }
+
+    addMedialSheet(*polyData, upIds, numFoldPoints, numStepsPlusCrest);
+    addCrestCurve(*polyData, crestIds);
+
+    return polyData;
+}
+
+} // namespace {}
+
+vtkSmartPointer<vtkPolyData> ShapePopulationData::ReadSRepJson(const std::string& a_filePath)
+{
+    FileRAII file(a_filePath);
+    if (!file.GetHandle())
+    {
+        return nullptr;
+    }
+
+    const size_t bufferSize = 65535;
+    std::vector<char> buffer(bufferSize);
+    rapidjson::FileReadStream fs(file.GetHandle(), buffer.data(), buffer.size());
+    std::unique_ptr<rapidjson::Document> jsonRoot(new rapidjson::Document);
+    if (jsonRoot->ParseStream(fs).HasParseError()) {
+        return nullptr;
+    }
+
+    try
+    {
+        if (jsonRoot->HasMember(keys::EllipticalSRep))
+        {
+            return ReadEllipticalSRepJson((*jsonRoot)[keys::EllipticalSRep]);
+        }
+        return nullptr;
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "Error reading SRep: " << e.what() << std::endl;
+        return nullptr;
+    }
+    catch (...)
+    {
+        std::cerr << "Unknown error reading SRep" << std::endl;
+        return nullptr;
+    }
+}
